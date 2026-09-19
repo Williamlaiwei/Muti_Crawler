@@ -1,6 +1,6 @@
 """
-Scribd Document Downloader v14
-==============================
+Scribd Document Downloader
+==========================
 
 A Selenium-based utility that loads a Scribd embed and saves it as a PDF.
 
@@ -15,11 +15,9 @@ Key behaviors:
 """
 
 import base64
-import builtins
 import os
 import re
 import tempfile
-import threading
 import time
 from io import BytesIO
 from urllib.parse import unquote, urlparse
@@ -54,29 +52,6 @@ HEADLESS_ENABLED = os.getenv("SCRIBD_HEADLESS", "1").strip().lower() not in {
 }
 DEFAULT_PAPER_WIDTH_INCHES = 7.25
 DEFAULT_PAPER_HEIGHT_INCHES = 10.5
-
-
-_LOG_STATE = threading.local()
-
-
-def _log(*args, **kwargs):
-    """Thread-local verbose logger used by the downloader internals."""
-    if getattr(_LOG_STATE, "verbose", True):
-        builtins.print(*args, **kwargs)
-
-
-def _check_cancel(stop_event):
-    if stop_event is not None and stop_event.is_set():
-        raise InterruptedError("Download interrupted by user.")
-
-
-def _emit_progress(progress_callback, **payload):
-    if progress_callback is not None:
-        try:
-            progress_callback(**payload)
-        except Exception:
-            # Progress UI must never break an actual download.
-            pass
 
 
 def build_chrome_options(runtime_profile_dir):
@@ -120,43 +95,23 @@ def convert_scribd_link(url):
     return f"https://www.scribd.com/embeds/{match.group(1)}/content"
 
 
-def get_filename_from_url(
-    url,
-    document_id=None,
-    title=None,
-):
+def get_filename_from_url(url):
     """
-    Build a Windows-safe unique filename.
+    Build a Windows-safe, unique output filename.
 
-    Batch mode should pass document_id and title from SQLite. URL parsing is
-    retained only as a fallback. This prevents the old `unknown_...pdf` names.
+    The Scribd document ID is prefixed to the title slug so two documents with
+    the same title do not overwrite each other during large batch runs.
     """
     parsed = urlparse(url)
     path = parsed.path.rstrip("/")
     last_segment = unquote(path.split("/")[-1]) if path else "scribd_document"
 
-    if document_id is None:
-        match = re.search(
-            r"/(?:document|doc)/(\d+)",
-            parsed.path,
-            re.IGNORECASE,
-        )
-        document_id = match.group(1) if match else "unknown"
+    match = re.search(r"/(?:document|doc)/(\\d+)", parsed.path, re.IGNORECASE)
+    document_id = match.group(1) if match else "unknown"
 
-    raw_title = str(title or last_segment or "scribd_document").strip()
-    raw_title = unquote(raw_title)
-
-    # Prefer a compact file-friendly title while preserving readable wording.
-    safe_title = re.sub(r'[<>:"/\\|?*]+', "_", raw_title)
-    safe_title = re.sub(r"\s+", "-", safe_title)
-    safe_title = re.sub(r"-{2,}", "-", safe_title)
-    safe_title = safe_title.strip(" ._-")
-
+    safe_title = re.sub(r'[<>:"/\\\\|?*]+', "_", last_segment).strip(" .")
     if not safe_title:
         safe_title = "scribd_document"
-
-    # Leave enough room for the document ID, extension and parent path.
-    safe_title = safe_title[:160].rstrip(" ._-")
 
     return f"{document_id}_{safe_title}.pdf"
 
@@ -288,7 +243,7 @@ def scroll_through_pages(driver, scroll_delay_seconds):
         total_pages = len(page_elements)
 
         if total_pages == 0:
-            _log("No page elements were detected.")
+            print("No page elements were detected.")
             return 0
 
         if total_pages == last_total_pages:
@@ -298,9 +253,9 @@ def scroll_through_pages(driver, scroll_delay_seconds):
             last_total_pages = total_pages
 
         if scrolled_count == 0:
-            _log(f"Found {total_pages} pages, scrolling...")
+            print(f"Found {total_pages} pages, scrolling...")
         elif total_pages > scrolled_count:
-            _log(f"Detected {total_pages} pages after lazy loading, continuing...")
+            print(f"Detected {total_pages} pages after lazy loading, continuing...")
 
         for index in range(scrolled_count, total_pages):
             driver.execute_script(
@@ -310,12 +265,12 @@ def scroll_through_pages(driver, scroll_delay_seconds):
             time.sleep(scroll_delay_seconds)
 
             if (index + 1) % 10 == 0:
-                _log(f"  Scrolled {index + 1}/{total_pages} pages...")
+                print(f"  Scrolled {index + 1}/{total_pages} pages...")
 
         scrolled_count = total_pages
         time.sleep(0.5)
 
-    _log(f"All {scrolled_count} pages loaded.")
+    print(f"All {scrolled_count} pages loaded.")
     return scrolled_count
 
 
@@ -458,14 +413,14 @@ def load_all_pages(driver):
     )
 
     if not result.get("supported"):
-        _log("Direct page loader unavailable; using scrolling fallback.")
+        print("Direct page loader unavailable; using scrolling fallback.")
         return scroll_through_pages(driver, DEFAULT_SCROLL_DELAY_SECONDS)
 
     total_pages = result["total"]
     loaded_pages = result["loaded"]
     elapsed_seconds = result["elapsedMs"] / 1000
 
-    _log(
+    print(
         f"Loaded {loaded_pages}/{total_pages} pages directly "
         f"in {elapsed_seconds:.2f}s "
         f"(concurrency: {DEFAULT_PAGE_LOAD_CONCURRENCY})."
@@ -528,11 +483,11 @@ def prepare_document_for_print(driver):
     )
 
     if result["toolbarTop"]:
-        _log("Top toolbar removed.")
+        print("Top toolbar removed.")
     if result["toolbarBottom"]:
-        _log("Bottom toolbar removed.")
+        print("Bottom toolbar removed.")
 
-    _log(f"Adjusted {result['containers']} scroll containers for print.")
+    print(f"Adjusted {result['containers']} scroll containers for print.")
 
 
 def inject_print_styles(driver):
@@ -622,7 +577,7 @@ def inject_print_styles(driver):
         """
     )
 
-    _log("Print CSS injected.")
+    print("Print CSS injected.")
 
 
 def wait_for_render_stability(driver, timeout_seconds):
@@ -702,13 +657,13 @@ def wait_for_render_stability(driver, timeout_seconds):
             int(timeout_seconds * 1000),
         )
     except WebDriverException as error:
-        _log(f"Render settle check failed; continuing with best effort: {error}")
+        print(f"Render settle check failed; continuing with best effort: {error}")
         return
 
     if result.get("timedOut"):
-        _log("Render settle reached its time budget; continuing with best effort.")
+        print("Render settle reached its time budget; continuing with best effort.")
     else:
-        _log("Document render settled before export.")
+        print("Document render settled before export.")
 
 
 def detect_document_paper_size(driver):
@@ -958,12 +913,8 @@ def save_pdf_pages_individually(
     driver,
     filename,
     timeout_seconds=DEFAULT_CDP_TIMEOUT_SECONDS,
-    stop_event=None,
-    progress_callback=None,
 ):
     from pypdf import PdfReader, PdfWriter
-
-    _check_cancel(stop_event)
 
     configure_command_timeout(
         driver,
@@ -983,14 +934,7 @@ def save_pdf_pages_individually(
             "No .outer_page elements found."
         )
 
-    _emit_progress(
-        progress_callback,
-        status="exporting",
-        current_page=0,
-        total_pages=page_count,
-    )
-
-    _log(
+    print(
         f"Exporting {page_count} "
         "document pages in bounded batches "
         f"of {DEFAULT_EXPORT_BATCH_SIZE}..."
@@ -1003,15 +947,6 @@ def save_pdf_pages_individually(
 
     try:
         for index in range(page_count):
-            _check_cancel(stop_event)
-
-            _emit_progress(
-                progress_callback,
-                status="exporting",
-                current_page=index + 1,
-                total_pages=page_count,
-            )
-
             if index % DEFAULT_EXPORT_BATCH_SIZE == 0:
                 batch_end = min(
                     page_count,
@@ -1020,7 +955,7 @@ def save_pdf_pages_individually(
                 batch_page_numbers = list(
                     range(index + 1, batch_end + 1)
                 )
-                _log(
+                print(
                     f"  Loading page batch "
                     f"{index + 1}-{batch_end}/{page_count}..."
                 )
@@ -1187,7 +1122,7 @@ def save_pdf_pages_individually(
             )
 
             if not page_info:
-                _log(
+                print(
                     f"  Skipping page "
                     f"{index + 1}: element missing"
                 )
@@ -1197,7 +1132,7 @@ def save_pdf_pages_individually(
             height_px = int(page_info["height"])
 
             if width_px <= 0 or height_px <= 0:
-                _log(
+                print(
                     f"  Skipping page {index + 1}: "
                     f"invalid geometry "
                     f"{width_px}x{height_px}"
@@ -1207,7 +1142,7 @@ def save_pdf_pages_individually(
             width_inches = width_px / 96.0
             height_inches = height_px / 96.0
 
-            _log(
+            print(
                 f"  Page {index + 1}/{page_count} "
                 f"{width_px}x{height_px}px "
                 f"-> "
@@ -1270,7 +1205,7 @@ def save_pdf_pages_individually(
                 page_handle.write(pdf_bytes)
             page_files.append(page_path)
 
-            _log(
+            print(
                 f"    OK: exactly 1 PDF sheet"
             )
 
@@ -1290,16 +1225,7 @@ def save_pdf_pages_individually(
                 "were exported."
             )
 
-        _check_cancel(stop_event)
-
-        _emit_progress(
-            progress_callback,
-            status="merging",
-            current_page=page_count,
-            total_pages=page_count,
-        )
-
-        _log(
+        print(
             f"Merging {len(page_files)} "
             "disk-spooled PDF pages..."
         )
@@ -1321,150 +1247,91 @@ def download_document(
     input_url,
     output_dir=r"E:\RMB\scribd",
     skip_existing=True,
-    document_id=None,
-    title=None,
-    verbose=True,
-    stop_event=None,
-    progress_callback=None,
-    driver_callback=None,
 ):
     """
     Download one Scribd document and return the absolute PDF path.
-
-    Batch mode can run quietly and receive progress callbacks. `driver_callback`
-    is called with the live WebDriver and later with None, allowing the parent
-    pipeline to terminate active ChromeDriver sessions on Ctrl+C.
     """
-    previous_verbose = getattr(_LOG_STATE, "verbose", True)
-    _LOG_STATE.verbose = verbose
-
     input_url = input_url.strip()
-    driver = None
+    converted_url = convert_scribd_link(input_url)
 
-    try:
-        _check_cancel(stop_event)
+    if converted_url == "Invalid Scribd URL":
+        raise ValueError(f"Invalid Scribd URL: {input_url}")
 
-        converted_url = convert_scribd_link(input_url)
+    os.makedirs(output_dir, exist_ok=True)
 
-        if converted_url == "Invalid Scribd URL":
-            raise ValueError(f"Invalid Scribd URL: {input_url}")
+    pdf_filename = os.path.join(
+        output_dir,
+        get_filename_from_url(input_url),
+    )
 
-        os.makedirs(output_dir, exist_ok=True)
+    if (
+        skip_existing
+        and os.path.exists(pdf_filename)
+        and os.path.getsize(pdf_filename) > 0
+    ):
+        print(f"[SKIP] Already exists: {pdf_filename}")
+        return os.path.abspath(pdf_filename)
 
-        pdf_filename = os.path.join(
-            output_dir,
-            get_filename_from_url(
-                input_url,
-                document_id=document_id,
-                title=title,
-            ),
-        )
+    print(f"Link embed: {converted_url}")
+    print(f"Output filename: {pdf_filename}")
 
-        if (
-            skip_existing
-            and os.path.exists(pdf_filename)
-            and os.path.getsize(pdf_filename) > 0
-        ):
-            _emit_progress(
-                progress_callback,
-                status="skipped",
-                current_page=0,
-                total_pages=0,
+    with tempfile.TemporaryDirectory(
+        prefix="scribd-chrome-profile-"
+    ) as runtime_profile_dir:
+        driver = None
+
+        try:
+            print("\nStarting Chrome browser...")
+
+            options = build_chrome_options(runtime_profile_dir)
+            driver = webdriver.Chrome(options=options)
+
+            driver.get(converted_url)
+            time.sleep(1)
+
+            hide_cookie_dialogs(driver)
+            print("Cookie dialogs hidden.")
+
+            total_pages = driver.execute_script(
+                """
+                return document.querySelectorAll('.outer_page').length;
+                """
             )
-            _log(f"[SKIP] Already exists: {pdf_filename}")
-            return os.path.abspath(pdf_filename)
 
-        _emit_progress(
-            progress_callback,
-            status="starting",
-            current_page=0,
-            total_pages=0,
-        )
-
-        with tempfile.TemporaryDirectory(
-            prefix="scribd-chrome-profile-"
-        ) as runtime_profile_dir:
-            try:
-                _check_cancel(stop_event)
-
-                options = build_chrome_options(runtime_profile_dir)
-                driver = webdriver.Chrome(options=options)
-
-                if driver_callback is not None:
-                    driver_callback(driver)
-
-                _emit_progress(
-                    progress_callback,
-                    status="loading",
-                    current_page=0,
-                    total_pages=0,
+            if total_pages == 0:
+                raise RuntimeError(
+                    "No printable document pages were detected."
                 )
 
-                driver.get(converted_url)
-                _check_cancel(stop_event)
-                time.sleep(1)
+            prepare_document_for_print(driver)
+            inject_print_styles(driver)
 
-                hide_cookie_dialogs(driver)
+            print(f"\nSaving PDF as: {pdf_filename}")
+            print("  Export mode: Individual document pages")
+            print("  Margins: None")
+            print("  Headers/Footers: Disabled")
+            print(
+                "  ChromeDriver command timeout: "
+                f"{DEFAULT_CDP_TIMEOUT_SECONDS}s"
+            )
 
-                total_pages = driver.execute_script(
-                    """
-                    return document.querySelectorAll('.outer_page').length;
-                    """
-                )
+            driver.execute_script("window.scrollTo(0, 0)")
 
-                if total_pages == 0:
-                    raise RuntimeError(
-                        "No printable document pages were detected."
-                    )
+            saved_path = save_pdf_pages_individually(
+                driver,
+                pdf_filename,
+            )
 
-                _emit_progress(
-                    progress_callback,
-                    status="preparing",
-                    current_page=0,
-                    total_pages=total_pages,
-                )
+            if not saved_path:
+                raise RuntimeError("PDF export failed.")
 
-                _check_cancel(stop_event)
+            print(f"PDF saved successfully to: {saved_path}")
+            return saved_path
 
-                prepare_document_for_print(driver)
-                inject_print_styles(driver)
-
-                driver.execute_script("window.scrollTo(0, 0)")
-
-                saved_path = save_pdf_pages_individually(
-                    driver,
-                    pdf_filename,
-                    stop_event=stop_event,
-                    progress_callback=progress_callback,
-                )
-
-                if not saved_path:
-                    raise RuntimeError("PDF export failed.")
-
-                _emit_progress(
-                    progress_callback,
-                    status="done",
-                    current_page=total_pages,
-                    total_pages=total_pages,
-                )
-
-                return saved_path
-
-            finally:
-                if driver is not None:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-
-                if driver_callback is not None:
-                    try:
-                        driver_callback(None)
-                    except Exception:
-                        pass
-
-    finally:
-        _LOG_STATE.verbose = previous_verbose
+        finally:
+            if driver is not None:
+                driver.quit()
+                print("Browser closed.")
 
 
 def main():
@@ -1478,7 +1345,7 @@ def main():
         RuntimeError,
         WebDriverException,
     ) as error:
-        _log(f"Export failed: {error}")
+        print(f"Export failed: {error}")
         raise SystemExit(1)
 
 

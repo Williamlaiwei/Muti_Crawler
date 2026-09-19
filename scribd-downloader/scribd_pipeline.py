@@ -1,6 +1,6 @@
 """
-Scribd Full Pipeline
-====================
+Scribd Full Pipeline v14
+========================
 
 Workflow:
 1. Generate unused keyword combinations.
@@ -17,8 +17,12 @@ Required sibling files:
 """
 
 import argparse
+import inspect
+import queue
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+import threading
+import time
 from pathlib import Path
 
 import scribd_search_pipeline as searcher
@@ -27,6 +31,28 @@ from scribd_downloader import download_document
 
 DEFAULT_DB = "scribd_state.db"
 DEFAULT_OUTPUT_DIR = r"E:\RMB\scribd"
+
+
+def validate_searcher_api():
+    """
+    Fail early if scribd_pipeline.py and scribd_search_pipeline.py do not match.
+    """
+    required = {
+        "result_wait_seconds",
+        "stable_checks",
+        "stable_interval_seconds",
+        "page_delay_seconds",
+    }
+
+    params = set(inspect.signature(searcher.run_pipeline).parameters)
+    missing = required - params
+
+    if missing:
+        raise SystemExit(
+            "scribd_search_pipeline.py is an older/incompatible version. "
+            "Replace it with the matching v14 file. Missing parameters: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def connect(db_path):
@@ -135,40 +161,135 @@ def download_counts(db_path):
     return rows
 
 
+
+def reset_stale_downloading(db_path):
+    """
+    Recover documents left in `downloading` by a prior interrupted run.
+
+    Interrupted attempts are not charged against max-attempts.
+    """
+    con = connect(db_path)
+    cur = con.execute(
+        """
+        UPDATE downloads
+        SET
+            status = 'queued',
+            attempts = CASE
+                WHEN attempts > 0 THEN attempts - 1
+                ELSE 0
+            END,
+            last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'downloading'
+        """
+    )
+    con.commit()
+    count = cur.rowcount
+    con.close()
+    return count
+
+
+def requeue_interrupted(db_path, document_id):
+    con = connect(db_path)
+    con.execute(
+        """
+        UPDATE downloads
+        SET
+            status = 'queued',
+            attempts = CASE
+                WHEN attempts > 0 THEN attempts - 1
+                ELSE 0
+            END,
+            last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE document_id = ?
+        """,
+        (document_id,),
+    )
+    con.commit()
+    con.close()
+
+
+def format_elapsed(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+
 def _download_one(
     db_path,
     output_dir,
     row,
     max_attempts,
-    index,
-    total,
+    worker_id,
+    stop_event,
+    update_worker,
+    register_driver,
 ):
     document_id, title, url, attempts = row
 
+    if stop_event.is_set():
+        return {
+            "status": "interrupted",
+            "document_id": document_id,
+        }
+
     if attempts >= max_attempts:
+        update_worker(
+            worker_id,
+            document_id=document_id,
+            title=title,
+            status="attempt limit",
+            current_page=0,
+            total_pages=0,
+        )
         return {
             "status": "skipped",
             "document_id": document_id,
-            "message": (
-                f"[{index}/{total}] [SKIP] "
-                f"{document_id} already attempted {attempts} times"
-            ),
         }
 
-    print()
-    print("=" * 72)
-    print(f"[{index}/{total}] {document_id}")
-    print(f"Title: {title}")
-    print(f"URL  : {url}")
-    print("=" * 72)
-
     mark_downloading(db_path, document_id)
+
+    update_worker(
+        worker_id,
+        document_id=document_id,
+        title=title,
+        status="starting",
+        current_page=0,
+        total_pages=0,
+    )
+
+    def progress_callback(
+        status=None,
+        current_page=0,
+        total_pages=0,
+        **_,
+    ):
+        update_worker(
+            worker_id,
+            document_id=document_id,
+            title=title,
+            status=status or "working",
+            current_page=current_page or 0,
+            total_pages=total_pages or 0,
+        )
+
+    def driver_callback(driver):
+        register_driver(worker_id, driver)
 
     try:
         saved_path = download_document(
             url,
             output_dir=output_dir,
             skip_existing=True,
+            document_id=document_id,
+            title=title,
+            verbose=False,
+            stop_event=stop_event,
+            progress_callback=progress_callback,
+            driver_callback=driver_callback,
         )
 
         mark_downloaded(
@@ -184,10 +305,15 @@ def _download_one(
         }
 
     except Exception as error:
-        print(
-            f"[DOWNLOAD ERROR] {document_id} "
-            f"{type(error).__name__}: {error}"
-        )
+        if stop_event.is_set() or isinstance(error, InterruptedError):
+            requeue_interrupted(
+                db_path,
+                document_id,
+            )
+            return {
+                "status": "interrupted",
+                "document_id": document_id,
+            }
 
         mark_failed(
             db_path,
@@ -201,6 +327,9 @@ def _download_one(
             "error": str(error),
         }
 
+    finally:
+        register_driver(worker_id, None)
+
 
 def batch_download(
     db_path,
@@ -210,12 +339,17 @@ def batch_download(
     workers=1,
 ):
     """
-    Download queued documents concurrently.
+    Download queued documents with 1-64 persistent worker slots.
 
-    Each worker launches its own independent Chrome instance through
-    download_document(). The command-line limit is 1-64 workers.
+    Ctrl+C:
+      - stops dispatching new documents;
+      - terminates active ChromeDriver processes;
+      - returns in-progress documents to `queued`;
+      - leaves not-yet-started documents queued.
     """
     searcher.init_db(db_path)
+
+    recovered = reset_stale_downloading(db_path)
 
     rows = get_queued_documents(
         db_path,
@@ -224,7 +358,13 @@ def batch_download(
 
     if not rows:
         print("[INFO] No queued documents to download.")
-        return
+        return {
+            "interrupted": False,
+            "downloaded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "selected": 0,
+        }
 
     print(
         f"\n========== DOWNLOAD BATCH ==========\n"
@@ -232,82 +372,264 @@ def batch_download(
         f"Output          : {output_dir}\n"
         f"Workers         : {workers}\n"
         f"Max attempts    : {max_attempts}\n"
+        f"Recovered queue : {recovered}\n"
         f"====================================\n"
     )
 
-    completed = 0
-    failed = 0
-    skipped_attempt_limit = 0
+    task_queue = queue.Queue()
+    for row in rows:
+        task_queue.put(row)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(
-                _download_one,
-                db_path,
-                output_dir,
-                row,
-                max_attempts,
-                index,
-                len(rows),
-            ): row[0]
-            for index, row in enumerate(rows, start=1)
+    stop_event = threading.Event()
+    state_lock = threading.Lock()
+    drivers_lock = threading.Lock()
+    dashboard_stop = threading.Event()
+
+    active_drivers = {}
+
+    counters = {
+        "downloaded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "interrupted": 0,
+    }
+
+    worker_states = {
+        wid: {
+            "document_id": "-",
+            "title": "waiting",
+            "status": "waiting",
+            "current_page": 0,
+            "total_pages": 0,
         }
+        for wid in range(1, workers + 1)
+    }
 
-        try:
-            for future in as_completed(futures):
-                document_id = futures[future]
+    def short_text(value, width=38):
+        value = str(value or "")
+        return value if len(value) <= width else value[: width - 1] + "…"
 
-                try:
-                    result = future.result()
-                except Exception as error:
-                    # This is a last-resort guard around unexpected worker errors.
-                    print(
-                        f"[WORKER ERROR] {document_id} "
-                        f"{type(error).__name__}: {error}"
-                    )
-                    mark_failed(
-                        db_path,
-                        document_id,
-                        error,
-                    )
-                    failed += 1
-                    continue
+    def progress_bar(current, total, width=18):
+        if total <= 0:
+            return "░" * width
+        current = max(0, min(int(current), int(total)))
+        filled = int(width * current / total)
+        return "█" * filled + "░" * (width - filled)
 
-                status = result["status"]
+    def update_worker(worker_id, **kwargs):
+        with state_lock:
+            worker_states[worker_id].update(kwargs)
 
-                if status == "downloaded":
-                    completed += 1
-                    print(
-                        f"[OK] {document_id} "
-                        f"({completed} downloaded this batch)"
-                    )
+    def register_driver(worker_id, driver):
+        with drivers_lock:
+            if driver is None:
+                active_drivers.pop(worker_id, None)
+            else:
+                active_drivers[worker_id] = driver
 
-                elif status == "failed":
-                    failed += 1
+    def terminate_active_drivers():
+        with drivers_lock:
+            snapshot = list(active_drivers.items())
 
-                elif status == "skipped":
-                    skipped_attempt_limit += 1
-                    print(result["message"])
+        for _, driver in snapshot:
+            try:
+                service = getattr(driver, "service", None)
+                process = getattr(service, "process", None)
 
-        except KeyboardInterrupt:
-            print(
-                "\n[INFO] Interrupted. "
-                "Running Chrome workers may need a moment to close."
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    def dashboard_loop():
+        first_draw = True
+
+        while not dashboard_stop.is_set():
+            with state_lock:
+                snapshot = {
+                    wid: dict(values)
+                    for wid, values in worker_states.items()
+                }
+                counts = dict(counters)
+
+            finished = (
+                counts["downloaded"]
+                + counts["failed"]
+                + counts["skipped"]
             )
-            raise
+
+            lines = [
+                (
+                    f"DOWNLOAD {progress_bar(finished, len(rows), 26)} "
+                    f"{finished}/{len(rows)} | "
+                    f"ok {counts['downloaded']} | "
+                    f"fail {counts['failed']} | "
+                    f"skip {counts['skipped']}"
+                )
+            ]
+
+            for wid in sorted(snapshot):
+                ws = snapshot[wid]
+                page_text = (
+                    f"{ws['current_page']}/{ws['total_pages']}"
+                    if ws["total_pages"] > 0
+                    else "-/-"
+                )
+
+                lines.append(
+                    f"W{wid:02d} "
+                    f"{progress_bar(ws['current_page'], ws['total_pages'])} "
+                    f"{page_text:>7} | "
+                    f"{str(ws['document_id']):<10} | "
+                    f"{short_text(ws['title']):<38} | "
+                    f"{ws['status']}"
+                )
+
+            if first_draw:
+                print("\n".join(lines), flush=True)
+                first_draw = False
+            else:
+                sys.stdout.write(f"\033[{len(lines)}F")
+                for line in lines:
+                    sys.stdout.write("\033[2K" + line + "\n")
+                sys.stdout.flush()
+
+            dashboard_stop.wait(0.5)
+
+    def worker_loop(worker_id):
+        while not stop_event.is_set():
+            try:
+                row = task_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                if stop_event.is_set():
+                    break
+
+                result = _download_one(
+                    db_path=db_path,
+                    output_dir=output_dir,
+                    row=row,
+                    max_attempts=max_attempts,
+                    worker_id=worker_id,
+                    stop_event=stop_event,
+                    update_worker=update_worker,
+                    register_driver=register_driver,
+                )
+
+                with state_lock:
+                    status = result["status"]
+                    if status in counters:
+                        counters[status] += 1
+
+                if result["status"] == "downloaded":
+                    update_worker(worker_id, status="done")
+                elif result["status"] == "failed":
+                    update_worker(worker_id, status="failed")
+                elif result["status"] == "skipped":
+                    update_worker(worker_id, status="skipped")
+                elif result["status"] == "interrupted":
+                    update_worker(worker_id, status="interrupted")
+
+            finally:
+                task_queue.task_done()
+
+        update_worker(worker_id, status="stopped")
+        register_driver(worker_id, None)
+
+    dashboard_thread = threading.Thread(
+        target=dashboard_loop,
+        name="download-dashboard",
+        daemon=True,
+    )
+    dashboard_thread.start()
+
+    worker_threads = [
+        threading.Thread(
+            target=worker_loop,
+            args=(wid,),
+            name=f"scribd-download-{wid}",
+            daemon=True,
+        )
+        for wid in range(1, workers + 1)
+    ]
+
+    for thread in worker_threads:
+        thread.start()
+
+    interrupted = False
+
+    try:
+        while any(thread.is_alive() for thread in worker_threads):
+            for thread in worker_threads:
+                thread.join(timeout=0.10)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+        terminate_active_drivers()
+
+        # Give workers a short window to catch the terminated Selenium command
+        # and return their in-progress rows to the queue.
+        deadline = time.perf_counter() + 3.0
+        for thread in worker_threads:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+    finally:
+        if interrupted:
+            stop_event.set()
+            terminate_active_drivers()
+
+        # Anything still marked downloading is returned to queued, including
+        # a worker that was blocked when Ctrl+C arrived.
+        reset_stale_downloading(db_path)
+
+        dashboard_stop.set()
+        dashboard_thread.join(timeout=1.5)
+        print()
 
     counts = download_counts(db_path)
 
+    with state_lock:
+        local_counts = dict(counters)
+
     print("\n========== DOWNLOAD SUMMARY ==========")
-    print(f"Downloaded this batch : {completed}")
-    print(f"Failed this batch     : {failed}")
-    print(f"Attempt-limit skips   : {skipped_attempt_limit}")
+    print(f"Downloaded this batch : {local_counts['downloaded']}")
+    print(f"Failed this batch     : {local_counts['failed']}")
+    print(f"Attempt-limit skips   : {local_counts['skipped']}")
     print(f"Workers used          : {workers}")
+    print(f"Interrupted           : {'yes' if interrupted else 'no'}")
     print(f"Database status       : {counts}")
     print("======================================\n")
 
+    return {
+        "interrupted": interrupted,
+        "downloaded": local_counts["downloaded"],
+        "failed": local_counts["failed"],
+        "skipped": local_counts["skipped"],
+        "selected": len(rows),
+    }
+
 
 def main():
+    total_started = time.perf_counter()
+    search_elapsed = 0.0
+    download_elapsed = 0.0
+    pipeline_interrupted = False
+
+    validate_searcher_api()
+
     parser = argparse.ArgumentParser(
         description=(
             "Generate/search/deduplicate Scribd documents, then batch-download "
@@ -320,8 +642,8 @@ def main():
         type=int,
         default=100,
         help=(
-            "Number of NEW unique documents to collect before downloading. "
-            "Use 0 to skip searching."
+            "Live NEW-document threshold for stopping NEW keyword assignment. "
+            "Already-running keywords finish normally. Use 0 to skip search."
         ),
     )
     parser.add_argument(
@@ -338,8 +660,8 @@ def main():
         type=int,
         default=3,
         help=(
-            "Number of Scribd search result pages to visit per keyword. "
-            "About 40 results are available per page, so 3 ~= 120 and 20 ~= 800."
+            "Maximum pages per keyword. Use 0 for automatic/unlimited paging "
+            "until that keyword is exhausted."
         ),
     )
     parser.add_argument(
@@ -347,8 +669,8 @@ def main():
         type=int,
         default=None,
         help=(
-            "Optional unique-document cap per keyword. "
-            "Defaults to pages-per-keyword * 40."
+            "Optional unique-document cap per keyword. If omitted: page_limit "
+            "* 40 in limited mode; unlimited in --pages-per-keyword 0 mode."
         ),
     )
     parser.add_argument(
@@ -365,75 +687,74 @@ def main():
         type=int,
         default=1,
         help=(
-            "Number of concurrent download workers / Chrome instances. "
+            "Concurrent download workers / Chrome instances. "
             "Allowed range: 1-64. Default: 1."
         ),
     )
-    parser.add_argument(
-        "--db",
-        default=DEFAULT_DB,
-        help="SQLite state database.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=DEFAULT_OUTPUT_DIR,
-        help="Folder where PDFs are saved.",
-    )
+    parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--queue-output",
         default="scribd_download_queue.txt",
-        help="Text export of currently queued URLs.",
     )
     parser.add_argument(
         "--metadata-output",
         default="scribd_documents.csv",
-        help="CSV export of discovered document metadata.",
     )
     parser.add_argument(
         "--pause",
         type=float,
         default=2.0,
-        help="Pause in seconds between searches.",
+        help="Pause in seconds between keyword searches.",
     )
     parser.add_argument(
         "--max-attempts",
         type=int,
         default=3,
-        help="Do not retry one document after this many download attempts.",
+        help="Maximum failed download attempts per document.",
     )
     parser.add_argument(
         "--result-wait",
         type=float,
-        default=15.0,
+        default=60.0,
         help=(
-            "Maximum seconds to wait for search result links on each Scribd "
-            "result page. Default: 15."
+            "Maximum seconds to wait on the SAME search result page. "
+            "The page is not refreshed. Default: 60."
         ),
     )
     parser.add_argument(
+        "--stable-checks",
+        type=int,
+        default=3,
+        help=(
+            "Positive result count must stay unchanged for this many checks "
+            "before the page is scanned. Default: 3."
+        ),
+    )
+    parser.add_argument(
+        "--stable-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between result-count stability checks. Default: 0.5.",
+    )
+    # Backward compatibility for old commands. v14 does not use either option.
+    parser.add_argument(
         "--render-settle",
         type=float,
-        default=1.5,
-        help=(
-            "Extra seconds to wait after results first appear before scanning "
-            "the page once. Default: 1.5."
-        ),
+        default=0.0,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--empty-retries",
         type=int,
-        default=1,
-        help=(
-            "Retry count when a result page returns zero documents. Default: 1."
-        ),
+        default=0,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--page-delay",
         type=float,
         default=2.0,
-        help=(
-            "Seconds between result pages for the same keyword. Default: 2."
-        ),
+        help="Seconds between result pages for one keyword. Default: 2.",
     )
     parser.add_argument(
         "--show-browser",
@@ -456,32 +777,82 @@ def main():
         raise SystemExit("--workers must be between 1 and 64")
     if not 1 <= args.search_workers <= 64:
         raise SystemExit("--search-workers must be between 1 and 64")
-    if args.pages_per_keyword <= 0:
-        raise SystemExit("--pages-per-keyword must be greater than 0")
+    if args.pages_per_keyword < 0:
+        raise SystemExit("--pages-per-keyword cannot be negative")
+    if args.max_per_query is not None and args.max_per_query <= 0:
+        raise SystemExit("--max-per-query must be greater than 0")
     if args.result_wait <= 0:
         raise SystemExit("--result-wait must be greater than 0")
-    if args.render_settle < 0:
-        raise SystemExit("--render-settle cannot be negative")
-    if args.empty_retries < 0:
-        raise SystemExit("--empty-retries cannot be negative")
+    if args.stable_checks <= 0:
+        raise SystemExit("--stable-checks must be greater than 0")
+    if args.stable_interval <= 0:
+        raise SystemExit("--stable-interval must be greater than 0")
     if args.page_delay < 0:
         raise SystemExit("--page-delay cannot be negative")
+    if args.max_attempts <= 0:
+        raise SystemExit("--max-attempts must be greater than 0")
 
     max_per_query = (
         args.max_per_query
         if args.max_per_query is not None
-        else args.pages_per_keyword * 40
+        else (
+            None
+            if args.pages_per_keyword == 0
+            else args.pages_per_keyword * 40
+        )
     )
-
-    if max_per_query <= 0:
-        raise SystemExit("--max-per-query must be greater than 0")
-    if args.max_attempts <= 0:
-        raise SystemExit("--max-attempts must be greater than 0")
 
     searcher.init_db(args.db)
 
+    theoretical_min_pages = (
+        (args.collect + 39) // 40
+        if args.collect > 0
+        else 0
+    )
+
+    pages_label = (
+        "auto / until exhausted"
+        if args.pages_per_keyword == 0
+        else str(args.pages_per_keyword)
+    )
+    max_docs_label = (
+        "unlimited"
+        if max_per_query is None
+        else str(max_per_query)
+    )
+
+    print("\n========== FULL PIPELINE CONFIG (v14) ==========")
+    print(f"Collect target         : {args.collect}")
+    print(f"Search workers         : {args.search_workers}")
+    print(f"Pages per keyword      : {pages_label}")
+    print(f"Max docs per keyword   : {max_docs_label}")
     if args.collect > 0:
-        searcher.run_pipeline(
+        print(
+            f"Theoretical min pages  : {theoretical_min_pages} "
+            "(before duplicates/empty pages)"
+        )
+    else:
+        print("Theoretical min pages  : 0 (search skipped)")
+    print(f"Result max wait        : {args.result_wait}s")
+    print(f"Stable checks          : {args.stable_checks}")
+    print(f"Stable interval        : {args.stable_interval}s")
+    print("Refresh/retry          : disabled")
+    print(f"Delay between pages    : {args.page_delay}s")
+    print(f"Delay between keywords : {max(args.pause, 0)}s")
+    print(f"Download batch         : {args.download_batch}")
+    print(f"Download workers       : {args.workers}")
+    print(f"Max download attempts  : {args.max_attempts}")
+    print(f"PDF output             : {args.output_dir}")
+    print(f"Database               : {args.db}")
+    print("================================================\n")
+
+    if args.collect == 0:
+        print("[INFO] Search phase skipped because --collect 0.")
+
+    if args.collect > 0:
+        search_started = time.perf_counter()
+
+        search_result = searcher.run_pipeline(
             db_path=args.db,
             target_new=args.collect,
             max_per_query=max_per_query,
@@ -493,13 +864,26 @@ def main():
             pages_per_keyword=args.pages_per_keyword,
             search_workers=args.search_workers,
             result_wait_seconds=args.result_wait,
-            render_settle_seconds=args.render_settle,
-            empty_retries=args.empty_retries,
+            stable_checks=args.stable_checks,
+            stable_interval_seconds=args.stable_interval,
             page_delay_seconds=args.page_delay,
         )
 
-    if args.download_batch > 0:
-        batch_download(
+        search_elapsed = time.perf_counter() - search_started
+
+        if search_result and search_result.get("interrupted"):
+            pipeline_interrupted = True
+
+    if args.download_batch == 0:
+        print("[INFO] Download phase skipped because --download-batch 0.")
+
+    if pipeline_interrupted and args.download_batch > 0:
+        print("[INFO] Download phase skipped because the pipeline was interrupted.")
+
+    if args.download_batch > 0 and not pipeline_interrupted:
+        download_started = time.perf_counter()
+
+        download_result = batch_download(
             db_path=args.db,
             output_dir=args.output_dir,
             limit=args.download_batch,
@@ -507,21 +891,29 @@ def main():
             workers=args.workers,
         )
 
-    searcher.export_queue(
-        args.db,
-        args.queue_output,
-    )
-    searcher.export_metadata_csv(
-        args.db,
-        args.metadata_output,
-    )
+        download_elapsed = time.perf_counter() - download_started
+
+        if download_result and download_result.get("interrupted"):
+            pipeline_interrupted = True
+
+    searcher.export_queue(args.db, args.queue_output)
+    searcher.export_metadata_csv(args.db, args.metadata_output)
 
     counts = download_counts(args.db)
-    print("\n========== FINAL STATUS ==========")
-    print(f"DB          : {Path(args.db).resolve()}")
-    print(f"PDF output  : {args.output_dir}")
-    print(f"Downloads   : {counts}")
-    print("==================================\n")
+    total_elapsed = time.perf_counter() - total_started
+
+    print("\n========== FINAL SUMMARY ==========")
+    print(f"DB               : {Path(args.db).resolve()}")
+    print(f"PDF output       : {args.output_dir}")
+    print(f"Downloads        : {counts}")
+    print(f"Search elapsed   : {format_elapsed(search_elapsed)}")
+    print(f"Download elapsed : {format_elapsed(download_elapsed)}")
+    print(f"Total elapsed    : {format_elapsed(total_elapsed)}")
+    print(
+        f"Status           : "
+        f"{'interrupted by user' if pipeline_interrupted else 'completed'}"
+    )
+    print("===================================\n")
 
 
 if __name__ == "__main__":
