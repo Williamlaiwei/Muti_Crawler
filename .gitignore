@@ -1,0 +1,52 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Cookies / login sessions
+cookies.json
+cookies.txt
+storage_state.json
+session.json
+
+# Browser profiles
+chrome_profile/
+browser_profile/
+user_data/
+browser_data/
+
+# Crawled data / downloads
+downloads/
+output/
+outputs/
+
+# Logs
+*.log
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+
+**/output/
+**/outputs/
+**/data/
+**/download/
+**/downloads/
+**/result/
+**/results/

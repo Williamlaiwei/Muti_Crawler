@@ -1,0 +1,16 @@
+# Python environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application specific
+output/
+*.pdf
+history.json
+
+# System files
+.DS_Store
+.vscode/
+.idea/
