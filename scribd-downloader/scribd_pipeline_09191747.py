@@ -336,7 +336,7 @@ def main():
     parser.add_argument(
         "--pages-per-keyword",
         type=int,
-        default=3,
+        default=20,
         help=(
             "Number of Scribd search result pages to visit per keyword. "
             "About 40 results are available per page, so 3 ~= 120 and 20 ~= 800."
@@ -402,40 +402,6 @@ def main():
         help="Do not retry one document after this many download attempts.",
     )
     parser.add_argument(
-        "--result-wait",
-        type=float,
-        default=15.0,
-        help=(
-            "Maximum seconds to wait for search result links on each Scribd "
-            "result page. Default: 15."
-        ),
-    )
-    parser.add_argument(
-        "--render-settle",
-        type=float,
-        default=1.5,
-        help=(
-            "Extra seconds to wait after results first appear before scanning "
-            "the page once. Default: 1.5."
-        ),
-    )
-    parser.add_argument(
-        "--empty-retries",
-        type=int,
-        default=1,
-        help=(
-            "Retry count when a result page returns zero documents. Default: 1."
-        ),
-    )
-    parser.add_argument(
-        "--page-delay",
-        type=float,
-        default=2.0,
-        help=(
-            "Seconds between result pages for the same keyword. Default: 2."
-        ),
-    )
-    parser.add_argument(
         "--show-browser",
         action="store_true",
         help="Show the SEARCH browser window instead of headless mode.",
@@ -458,14 +424,6 @@ def main():
         raise SystemExit("--search-workers must be between 1 and 64")
     if args.pages_per_keyword <= 0:
         raise SystemExit("--pages-per-keyword must be greater than 0")
-    if args.result_wait <= 0:
-        raise SystemExit("--result-wait must be greater than 0")
-    if args.render_settle < 0:
-        raise SystemExit("--render-settle cannot be negative")
-    if args.empty_retries < 0:
-        raise SystemExit("--empty-retries cannot be negative")
-    if args.page_delay < 0:
-        raise SystemExit("--page-delay cannot be negative")
 
     max_per_query = (
         args.max_per_query
@@ -492,10 +450,6 @@ def main():
             pause_between_queries=max(args.pause, 0),
             pages_per_keyword=args.pages_per_keyword,
             search_workers=args.search_workers,
-            result_wait_seconds=args.result_wait,
-            render_settle_seconds=args.render_settle,
-            empty_retries=args.empty_retries,
-            page_delay_seconds=args.page_delay,
         )
 
     if args.download_batch > 0:

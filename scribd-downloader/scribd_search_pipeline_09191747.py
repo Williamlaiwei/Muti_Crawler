@@ -6,12 +6,12 @@ import re
 import sqlite3
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -474,19 +474,9 @@ def build_search_url(keyword, page=1):
     return "https://www.scribd.com/search?" + urlencode(params)
 
 
-def search_scribd(
-    driver,
-    keyword,
-    page=1,
-    result_wait_seconds=15.0,
-    render_settle_seconds=1.5,
-):
+def search_scribd(driver, keyword, page=1):
     """
     Open one filtered Scribd result page directly.
-
-    The page is scanned only once, but we wait for result links to appear first
-    and then allow a short render-settle period. This improves reliability when
-    multiple search workers are running at the same time.
     """
     search_url = build_search_url(keyword, page=page)
 
@@ -496,42 +486,8 @@ def search_scribd(
     print(f"[URL] {search_url}")
 
     driver.get(search_url)
-
-    # Wait for basic page readiness.
-    try:
-        WebDriverWait(
-            driver,
-            min(max(result_wait_seconds, 1.0), 60.0),
-        ).until(
-            lambda d: d.execute_script("return document.readyState")
-            in ("interactive", "complete")
-        )
-    except TimeoutException:
-        pass
-
+    time.sleep(3)
     dismiss_popups(driver)
-
-    # Wait for at least one Scribd document card/link.
-    found_result = False
-    try:
-        WebDriverWait(
-            driver,
-            min(max(result_wait_seconds, 1.0), 60.0),
-        ).until(
-            lambda d: len(
-                d.find_elements(
-                    By.CSS_SELECTOR,
-                    "a[href*='/document/'], a[href*='/doc/']",
-                )
-            ) > 0
-        )
-        found_result = True
-    except TimeoutException:
-        pass
-
-    # Give the card list a little time to finish rendering before the one scan.
-    if found_result and render_settle_seconds > 0:
-        time.sleep(render_settle_seconds)
 
     print(f"[INFO] Loaded page {page}: {driver.current_url}")
 
@@ -600,157 +556,42 @@ def collect_one_result_page(
     driver,
     keyword,
     page_number,
-    stop_event=None,
-    result_wait_seconds=15.0,
-    render_settle_seconds=1.5,
-    empty_retries=1,
 ):
     """
-    Open one explicit result page and scan it once.
+    Open one explicit Scribd search result page and scan its document cards once.
 
-    If the first scan returns zero document links, retry the same page up to
-    `empty_retries` times before treating it as genuinely empty.
+    Scribd currently exposes about 40 results per result page, so repeated DOM
+    scans are intentionally avoided for speed.
     """
-    attempts = max(1, int(empty_retries) + 1)
+    search_scribd(
+        driver,
+        keyword,
+        page=page_number,
+    )
 
-    for attempt in range(1, attempts + 1):
-        if stop_event is not None and stop_event.is_set():
-            return []
+    page_documents = {}
 
-        search_scribd(
-            driver,
-            keyword,
-            page=page_number,
-            result_wait_seconds=result_wait_seconds,
-            render_settle_seconds=render_settle_seconds,
-        )
+    visible = collect_visible_documents(driver)
 
-        if stop_event is not None and stop_event.is_set():
-            return []
+    for item in visible:
+        doc_id = item["id"]
+        if not doc_id:
+            continue
 
-        page_documents = {}
-        visible = collect_visible_documents(driver)
-
-        for item in visible:
-            doc_id = item["id"]
-            if not doc_id:
-                continue
-
-            if doc_id not in page_documents:
-                page_documents[doc_id] = item
-            elif (
-                not page_documents[doc_id]["title"]
-                and item["title"]
-            ):
-                page_documents[doc_id]["title"] = item["title"]
-
-        print(
-            f"    page={page_number} "
-            f"attempt={attempt}/{attempts} "
-            f"page_unique={len(page_documents)}"
-        )
-
-        if page_documents:
-            return list(page_documents.values())
-
-        if attempt < attempts:
-            print(
-                f"    [RETRY] page={page_number} returned 0 documents; "
-                "retrying same page..."
-            )
-
-    return []
-
-
-def collect_search_results(
-    driver,
-    keyword,
-    max_results,
-    max_pages=20,
-    stop_event=None,
-    result_wait_seconds=15.0,
-    render_settle_seconds=1.5,
-    empty_retries=1,
-    page_delay_seconds=2.0,
-):
-    """
-    Directly visit page=1 through page=max_pages.
-
-    Each page is scanned once after it is ready. Empty pages may be retried.
-    A short configurable delay is used between result pages.
-
-    Stops when:
-      - max_results unique documents have been collected;
-      - max_pages has been reached;
-      - or two consecutive pages produce no new document IDs.
-    """
-    documents = {}
-    empty_or_duplicate_pages = 0
-
-    for page_number in range(1, max_pages + 1):
-        if stop_event is not None and stop_event.is_set():
-            break
-
-        if len(documents) >= max_results:
-            break
-
-        before_count = len(documents)
-
-        page_results = collect_one_result_page(
-            driver,
-            keyword,
-            page_number,
-            stop_event=stop_event,
-            result_wait_seconds=result_wait_seconds,
-            render_settle_seconds=render_settle_seconds,
-            empty_retries=empty_retries,
-        )
-
-        for item in page_results:
-            doc_id = item["id"]
-            if not doc_id:
-                continue
-
-            if doc_id not in documents:
-                documents[doc_id] = item
-            elif (
-                not documents[doc_id]["title"]
-                and item["title"]
-            ):
-                documents[doc_id]["title"] = item["title"]
-
-        new_on_page = len(documents) - before_count
-
-        print(
-            f"[PAGE DONE] {page_number}/{max_pages} "
-            f"page_results={len(page_results)} "
-            f"new={new_on_page} "
-            f"total_unique={len(documents)}/{max_results}"
-        )
-
-        if new_on_page == 0:
-            empty_or_duplicate_pages += 1
-        else:
-            empty_or_duplicate_pages = 0
-
-        if empty_or_duplicate_pages >= 2:
-            print(
-                "[INFO] Two consecutive pages added no new documents; "
-                "stopping this keyword."
-            )
-            break
-
-        if (
-            page_number < max_pages
-            and page_delay_seconds > 0
-            and (stop_event is None or not stop_event.is_set())
+        if doc_id not in page_documents:
+            page_documents[doc_id] = item
+        elif (
+            not page_documents[doc_id]["title"]
+            and item["title"]
         ):
-            if stop_event is not None:
-                stop_event.wait(page_delay_seconds)
-            else:
-                time.sleep(page_delay_seconds)
+            page_documents[doc_id]["title"] = item["title"]
 
-    return list(documents.values())[:max_results]
+    print(
+        f"    page={page_number} "
+        f"page_unique={len(page_documents)}"
+    )
+
+    return list(page_documents.values())
 
 
 def collect_search_results(
@@ -758,7 +599,6 @@ def collect_search_results(
     keyword,
     max_results,
     max_pages=20,
-    stop_event=None,
 ):
     """
     Directly visit page=1 through page=max_pages.
@@ -772,9 +612,6 @@ def collect_search_results(
     empty_or_duplicate_pages = 0
 
     for page_number in range(1, max_pages + 1):
-        if stop_event is not None and stop_event.is_set():
-            break
-
         if len(documents) >= max_results:
             break
 
@@ -784,7 +621,6 @@ def collect_search_results(
             driver,
             keyword,
             page_number,
-            stop_event=stop_event,
         )
 
         for item in page_results:
@@ -839,19 +675,12 @@ def run_pipeline(
     pause_between_queries=2.0,
     pages_per_keyword=3,
     search_workers=1,
-    result_wait_seconds=15.0,
-    render_settle_seconds=1.5,
-    empty_retries=1,
-    page_delay_seconds=2.0,
 ):
     """
     Search Scribd with 1-64 concurrent search workers.
 
-    Improvements:
-      - Ctrl+C sets a shared stop flag and closes active ChromeDriver sessions.
-      - Workers check the stop flag between pages/keywords.
-      - Any search/driver failure causes that worker to recreate Chrome before
-        taking the next keyword, instead of reusing a dead localhost session.
+    Each worker owns its own Chrome instance and processes different keywords.
+    SQLite remains the global deduplication/state store.
     """
     init_db(db_path)
 
@@ -867,63 +696,18 @@ def run_pipeline(
 
     counter_lock = threading.Lock()
     db_lock = threading.Lock()
-    drivers_lock = threading.Lock()
     stop_event = threading.Event()
-
-    active_drivers = {}
 
     state = {
         "new_this_run": 0,
         "queries_finished": 0,
     }
 
-    def register_driver(worker_id, driver):
-        with drivers_lock:
-            active_drivers[worker_id] = driver
-
-    def unregister_driver(worker_id):
-        with drivers_lock:
-            active_drivers.pop(worker_id, None)
-
-    def close_driver(worker_id, driver):
-        if driver is None:
-            return
-
-        # Normal quit first.
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-        unregister_driver(worker_id)
-
-    def force_stop_active_drivers():
-        """
-        Break workers out of blocked Selenium calls as quickly as practical.
-        """
-        with drivers_lock:
-            snapshot = list(active_drivers.items())
-
-        for worker_id, driver in snapshot:
-            try:
-                service = getattr(driver, "service", None)
-                process = getattr(service, "process", None)
-
-                if process is not None and process.poll() is None:
-                    process.terminate()
-            except Exception:
-                pass
-
-    def make_driver(worker_id):
-        driver = build_driver(headless=headless)
-        register_driver(worker_id, driver)
-        return driver
-
     def process_worker(worker_id):
         driver = None
 
         try:
-            driver = make_driver(worker_id)
+            driver = build_driver(headless=headless)
 
             while not stop_event.is_set():
                 with counter_lock:
@@ -949,14 +733,9 @@ def run_pipeline(
                         db_lock,
                     )
 
-                if stop_event.is_set():
-                    break
-
                 print(
                     f"[SEARCH W{worker_id}] START keyword={keyword!r}"
                 )
-
-                driver_failed = False
 
                 try:
                     results = collect_search_results(
@@ -964,16 +743,9 @@ def run_pipeline(
                         keyword=keyword,
                         max_results=max_per_query,
                         max_pages=pages_per_keyword,
-                        stop_event=stop_event,
-                        result_wait_seconds=result_wait_seconds,
-                        render_settle_seconds=render_settle_seconds,
-                        empty_retries=empty_retries,
-                        page_delay_seconds=page_delay_seconds,
                     )
 
-                    if stop_event.is_set():
-                        break
-
+                    # Serialize the relatively short DB write transaction.
                     with db_lock:
                         new_count = save_search_results(
                             db_path,
@@ -1001,10 +773,11 @@ def run_pipeline(
                         f"queries={searched}"
                     )
 
-                except Exception as error:
-                    if stop_event.is_set():
-                        break
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    raise
 
+                except Exception as error:
                     print(
                         f"[SEARCH W{worker_id}] ERROR "
                         f"{type(error).__name__}: {error}"
@@ -1017,38 +790,18 @@ def run_pipeline(
                             error,
                         )
 
-                    # Do not reuse a Selenium session after an exception.
-                    # The old version kept issuing requests to a dead localhost
-                    # ChromeDriver port, producing endless MaxRetryError loops.
-                    driver_failed = True
-
-                if driver_failed and not stop_event.is_set():
-                    print(
-                        f"[SEARCH W{worker_id}] "
-                        "Restarting Chrome after worker error..."
-                    )
-                    close_driver(worker_id, driver)
-                    driver = None
-
-                    try:
-                        driver = make_driver(worker_id)
-                    except Exception as error:
-                        print(
-                            f"[SEARCH W{worker_id}] "
-                            f"Chrome restart failed: {error}"
-                        )
-                        stop_event.set()
-                        break
-
                 if one_keyword:
                     break
 
-                # Interruptible pause.
                 if pause_between_queries > 0:
-                    stop_event.wait(pause_between_queries)
+                    time.sleep(pause_between_queries)
 
         finally:
-            close_driver(worker_id, driver)
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
     print(
         "\n========== SEARCH CONFIG ==========\n"
@@ -1056,65 +809,29 @@ def run_pipeline(
         f"Target new documents : {target_new}\n"
         f"Pages per keyword    : {pages_per_keyword}\n"
         f"Max docs per keyword : {max_per_query}\n"
-        f"Result wait          : {result_wait_seconds}s\n"
-        f"Render settle        : {render_settle_seconds}s\n"
-        f"Empty retries        : {empty_retries}\n"
-        f"Delay between pages  : {page_delay_seconds}s\n"
         f"===================================\n"
     )
 
-    executor = ThreadPoolExecutor(
-        max_workers=search_workers,
-        thread_name_prefix="scribd-search",
-    )
-
-    futures = [
-        executor.submit(process_worker, worker_id)
-        for worker_id in range(1, search_workers + 1)
-    ]
-
-    interrupted = False
-
     try:
-        pending = set(futures)
+        with ThreadPoolExecutor(
+            max_workers=search_workers,
+            thread_name_prefix="scribd-search",
+        ) as executor:
+            futures = [
+                executor.submit(process_worker, worker_id)
+                for worker_id in range(1, search_workers + 1)
+            ]
 
-        # Poll rather than blocking on one future forever. This lets the main
-        # thread react promptly to Ctrl+C on Windows.
-        while pending:
-            done, pending = wait(
-                pending,
-                timeout=0.25,
-                return_when=FIRST_COMPLETED,
-            )
-
-            for future in done:
+            for future in futures:
                 future.result()
 
-            if stop_event.is_set() and pending:
-                # Workers should exit after the current Selenium call/page.
-                continue
-
     except KeyboardInterrupt:
-        interrupted = True
         stop_event.set()
-
         print(
-            "\n[INFO] Ctrl+C received. "
-            "Stopping search workers and closing Chrome sessions..."
+            "\n[INFO] Search interrupted. "
+            "Workers may need a moment to close Chrome."
         )
-
-        force_stop_active_drivers()
-
-        for future in futures:
-            future.cancel()
-
-    finally:
-        # Do not wait forever after Ctrl+C. Killing ChromeDriver above releases
-        # workers blocked in driver.get(), and cancel_futures prevents queued work.
-        executor.shutdown(
-            wait=not interrupted,
-            cancel_futures=True,
-        )
+        raise
 
     queue_count = export_queue(db_path, queue_output)
     metadata_count = export_metadata_csv(db_path, metadata_output)
@@ -1128,9 +845,8 @@ def run_pipeline(
     print(f"Database                : {db_path}")
     print(f"Queue file              : {queue_output}")
     print(f"Metadata CSV            : {metadata_output}")
-    if interrupted:
-        print("Status                  : interrupted by user")
     print("====================================")
+
 
 
 
@@ -1159,7 +875,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pages-per-keyword",
         type=int,
-        default=3,
+        default=20,
         help=(
             "How many explicit Scribd result pages to visit for each keyword. "
             "Scribd currently shows about 40 results per page. "
@@ -1202,42 +918,6 @@ if __name__ == "__main__":
         help="Pause in seconds between keyword searches.",
     )
     parser.add_argument(
-        "--result-wait",
-        type=float,
-        default=15.0,
-        help=(
-            "Maximum seconds to wait for Scribd result links on each page. "
-            "Default: 15."
-        ),
-    )
-    parser.add_argument(
-        "--render-settle",
-        type=float,
-        default=1.5,
-        help=(
-            "Extra seconds to wait after result links first appear before the "
-            "single DOM scan. Default: 1.5."
-        ),
-    )
-    parser.add_argument(
-        "--empty-retries",
-        type=int,
-        default=1,
-        help=(
-            "Number of times to retry the same page if the one scan returns "
-            "zero documents. Default: 1."
-        ),
-    )
-    parser.add_argument(
-        "--page-delay",
-        type=float,
-        default=2.0,
-        help=(
-            "Seconds to wait between explicit result pages for the same keyword. "
-            "Default: 2."
-        ),
-    )
-    parser.add_argument(
         "--show-browser",
         action="store_true",
         help="Show Chrome instead of headless mode.",
@@ -1250,14 +930,6 @@ if __name__ == "__main__":
         raise SystemExit("--search-workers must be between 1 and 64")
     if args.pages_per_keyword <= 0:
         raise SystemExit("--pages-per-keyword must be greater than 0")
-    if args.result_wait <= 0:
-        raise SystemExit("--result-wait must be greater than 0")
-    if args.render_settle < 0:
-        raise SystemExit("--render-settle cannot be negative")
-    if args.empty_retries < 0:
-        raise SystemExit("--empty-retries cannot be negative")
-    if args.page_delay < 0:
-        raise SystemExit("--page-delay cannot be negative")
 
     max_per_query = (
         args.max_per_query
@@ -1279,8 +951,4 @@ if __name__ == "__main__":
         pause_between_queries=max(args.pause, 0),
         pages_per_keyword=args.pages_per_keyword,
         search_workers=args.search_workers,
-        result_wait_seconds=args.result_wait,
-        render_settle_seconds=args.render_settle,
-        empty_retries=args.empty_retries,
-        page_delay_seconds=args.page_delay,
     )
