@@ -1243,7 +1243,8 @@ def main():
     input_url = input("Input link Scribd: ").strip()
 
     converted_url = convert_scribd_link(input_url)
-    output_dir = "downloads"
+    #output_dir = "downloads"
+    output_dir = r"E:\RMB\scribd"
     os.makedirs(output_dir, exist_ok=True)
     
     pdf_filename = os.path.join(
