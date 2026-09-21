@@ -1,0 +1,66 @@
+SCRIBD SEARCH DIAGNOSTIC — separate window (main dashboard untouched)
+======================================================================================
+CONFIG workers=6  stable=2x5.0s  result_wait=30.0s  page_delay=5.0s  load=eager  images_blocked=True
+LIVE   active=6  zero_waiting=6  positive_waiting=0  state=zero_storm
+SYSTEM CPU=n/a  RAM=n/a  avail=n/a  browserRSS=n/a  browserProc=None  RX=n/a  TX=n/a
+SYSTEM NOTE: psutil not installed -> CPU/RAM/network fields unavailable. Run: python -m pip install psutil
+-
+LAST 120s pages=16  zero=11 (68.8%)  stable=5 (31.2%)  avg_nav=1.26s  avg_wait=23.82s  avg_total=25.71s
+CLASS  explicit_no_results:10, ok:5, zero_unknown:1
+-
+CHECK  ALERT: >=80% of active workers are simultaneously waiting with 0 document anchors.
+CHECK  CPU/RAM are not obviously saturated; compare 6/8/10/12 workers and inspect URL/title/body fields before blaming hardware.
+-
+WORKERS
+W01 p1   waiting    obs=0   page=None found=0    project management Vietnam 1995
+W02 p2   waiting    obs=0   page=None found=40   urban planning Singapore
+W03 p13  waiting    obs=0   page=None found=280  college data science
+W04 p1   waiting    obs=0   page=None found=0    second year computer science
+W05 p2   waiting    obs=0   page=None found=40   materials engineering 2013
+W06 p2   waiting    obs=0   page=None found=40   postgraduate neuroscience summary
+-
+RECENT PROBLEMS (last 8)
+53+10:00 W05 p5 explicit_no_results obs=0 uniq=0 nav=1.84s wait=30.08s ready=complete req/actual=5/5
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=communication+2012&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%22%7D&pa…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=32 transfer=1087B online=True body_len=611
+56+10:00 W03 p10 explicit_no_results obs=0 uniq=0 nav=0.81s wait=30.09s ready=complete req/actual=10/10
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=college+data+science&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%22%7D&…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=31 transfer=1387B online=True body_len=611
+01+10:00 W01 p10 explicit_no_results obs=0 uniq=0 nav=2.07s wait=30.07s ready=complete req/actual=10/10
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=genetics+thesis+2007&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%22%7D&…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=37 transfer=1387B online=True body_len=611
+24+10:00 W02 p5 explicit_no_results obs=0 uniq=0 nav=1.04s wait=30.07s ready=complete req/actual=5/5
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=environmental+engineering+lecture+notes+UAE+1997&ct_lang=0&filters=%7B%22…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=31 transfer=1387B online=True body_len=611
+25+10:00 W06 p22 explicit_no_results obs=0 uniq=0 nav=1.03s wait=30.09s ready=complete req/actual=22/22
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=natural+language+processing+concepts+2004&ct_lang=0&filters=%7B%22num_pag…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=31 transfer=1387B online=True body_len=611
+29+10:00 W05 p6 explicit_no_results obs=0 uniq=0 nav=0.68s wait=30.08s ready=complete req/actual=6/6
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=communication+2012&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%22%7D&pa…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=31 transfer=1387B online=True body_len=611
+29+10:00 W04 p15 explicit_no_results obs=0 uniq=0 nav=1.08s wait=30.10s ready=complete req/actual=15/15
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=college+project+management&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days No results fo…
+    resources=35 transfer=1087B online=True body_len=611
+38+10:00 W01 p11 zero_unknown obs=0 uniq=0 nav=1.69s wait=30.08s ready=complete req/actual=11/11
+    title=Search | Scribd
+    url=https://www.scribd.com/search?query=genetics+thesis+2007&ct_lang=0&filters=%7B%22num_pages%22%3A%221-3%22%7D&…
+    body=Search Clear search Search EN CHANGE LANGUAGE, ENGLISH Upload Sign in Download free for 30 days Filter by Cle…
+    resources=37 transfer=6075B online=True body_len=3706
+-
+BROWSER STARTUP count=26 avg=5.76s max=11.06s
+======================================================================================
+Tip: send scribd_debug_snapshot.txt or copy this whole window when 12 workers turns all-zero.
