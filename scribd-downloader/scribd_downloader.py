@@ -1,8 +1,11 @@
 """
-Scribd Document Downloader v14
+Scribd Document Downloader v16
 ==============================
 
 A Selenium-based utility that loads a Scribd embed and saves it as a PDF.
+
+Downloader logic is intentionally unchanged from the v15 stable baseline;
+v16 optimization work is limited to the SEARCH side.
 
 Key behaviors:
 1. Converts a Scribd document URL to the embed/content URL.
